@@ -1,6 +1,13 @@
-// Package streamhub keeps session streams in Redis so producers,
-// subscribers, and cancels can land on different instances.
-// Generation IDs are used as fencing tokens to keep stale producers out.
+// Package streamhub provides resumable LLM streaming for Go, backed by Redis.
+//
+// It is meant for the case where the code producing a stream and the code
+// consuming it don't share the same lifetime — they might not even be on
+// the same instance. Chunks are stored in Redis Streams so reconnecting
+// subscribers can replay what they missed, and cancel signals are delivered
+// via Redis Pub/Sub so a generation can be stopped from anywhere.
+//
+// Each producer gets a generation ID as a fencing token, and only one
+// producer can own a session at a time.
 package streamhub
 
 import (
