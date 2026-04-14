@@ -1,5 +1,8 @@
 # streamhub
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/gtoxlili/streamhub.svg)](https://pkg.go.dev/github.com/gtoxlili/streamhub)
+[![Go Report Card](https://goreportcard.com/badge/github.com/gtoxlili/streamhub)](https://goreportcard.com/report/github.com/gtoxlili/streamhub)
+
 Resumable LLM streaming for Go, backed by Redis.
 
 `streamhub` is meant for the fairly common case where the code producing a stream and the code consuming it don't share the same lifetime — they might not even be on the same instance. Think LLM responses, SSE endpoints, or anything where you need the stream to survive reconnects.
