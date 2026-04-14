@@ -1,0 +1,15 @@
+/dist/
+/.idea/
+/.vscode/
+/*.exe
+/*.log
+/*.out
+/*.test
+/vendor/
+*.sqlite
+
+/dev/
+
+.DS_Store
+/var/
+/docs/*
