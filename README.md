@@ -1,42 +1,10 @@
 # streamhub
 
-Resumable, durable LLM/AI streaming for Go — backed by Redis.
+Resumable LLM streaming for Go, backed by Redis.
 
-`streamhub` is the Go equivalent of [vercel/resumable-stream](https://github.com/vercel/resumable-stream). It lets you build **LLM and AI agent streams that survive disconnects, reconnects, and process restarts** — without coupling the producer and consumer to the same lifetime or server instance.
+`streamhub` is meant for the fairly common case where the code producing a stream and the code consuming it don't share the same lifetime — they might not even be on the same instance. Think LLM responses, SSE endpoints, or anything where you need the stream to survive reconnects.
 
-## The problem
-
-When you stream an LLM response (or any long-running AI task) over SSE/WebSocket, a page refresh, network blip, or load-balancer failover kills the connection. The generation keeps running on the backend, but the client loses all in-flight tokens. Restarting is expensive — both in cost and user experience.
-
-In a distributed setup, it gets worse: the process generating the stream and the process serving the client may be different instances entirely. You need durable, shared state to reconnect them.
-
-## How streamhub solves it
-
-- **Redis Streams** store every chunk, so new or reconnecting subscribers **replay** what they missed and then seamlessly receive live data — no duplicates, no gaps.
-- **Redis Pub/Sub** delivers **cancel signals** instantly, so a user can stop generation from any client or service instance.
-- **Generation-based fencing** (like a fencing token) prevents stale producers from writing into a newer stream after losing ownership.
-- **Single-producer registration** ensures only one producer runs per session — no duplicate LLM calls.
-
-## Use cases
-
-- LLM / AI agent response streaming (ChatGPT-style, Claude-style)
-- Server-Sent Events (SSE) or WebSocket streaming with reconnect and replay
-- Incremental output from long-running background tasks
-- Multi-instance stream sharing with durable state in Redis
-- Remote cancel of in-progress AI generation
-
-## Comparison
-
-| Feature | streamhub (Go) | [vercel/resumable-stream](https://github.com/vercel/resumable-stream) (TS) | [ai-resumable-stream](https://github.com/zirkelc/ai-resumable-stream) (TS) |
-|---|---|---|---|
-| Language | **Go** | TypeScript | TypeScript |
-| Redis Stream persistence | ✅ | ✅ | ✅ |
-| Pub/Sub cancel signal | ✅ | ❌ | ✅ |
-| Reconnect with replay | ✅ | ✅ | ✅ |
-| Generation fencing token | ✅ | ✅ | ❌ |
-| Single-producer registration | ✅ | ❌ | ❌ |
-| Per-stream metadata | ✅ | ❌ | ❌ |
-| Framework-agnostic | ✅ | Tied to AI SDK | Tied to AI SDK |
+It uses Redis Streams for chunk persistence (so subscribers can replay what they missed) and Redis Pub/Sub for cancel signals (so you can stop a generation from anywhere). Each producer gets a generation ID as a fencing token, and only one producer can own a session at a time.
 
 ## Requirements
 
@@ -49,60 +17,45 @@ In a distributed setup, it gets worse: the process generating the stream and the
 go get github.com/gtoxlili/streamhub
 ```
 
-## Quick start
+## Usage
 
 Create a `Hub`:
 
 ```go
-package main
-
-import (
-	"log"
-
-	"github.com/gtoxlili/streamhub"
-	"github.com/redis/rueidis"
-)
-
-func main() {
-	client, err := rueidis.NewClient(rueidis.ClientOption{
-		InitAddress: []string{"127.0.0.1:6379"},
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer client.Close()
-
-	hub := streamhub.New(client)
-	_ = hub
+client, err := rueidis.NewClient(rueidis.ClientOption{
+	InitAddress: []string{"127.0.0.1:6379"},
+})
+if err != nil {
+	log.Fatal(err)
 }
+defer client.Close()
+
+hub := streamhub.New(client)
 ```
 
-Register on the producer side:
+Register a producer:
 
 ```go
 stream, created, err := hub.Register("chat:123", func() {
-	// cancel your runtime task here (e.g. abort LLM generation)
+	// called when someone cancels this session
 })
 if err != nil {
 	log.Fatal(err)
 }
 if !created {
-	// another producer already owns this session — do not start a duplicate
-	return
+	return // another instance already owns this session
 }
 defer stream.Close()
 
-stream.SetMetadata(map[string]any{
-	"model": "claude-sonnet-4-20250514",
-})
+stream.SetMetadata(map[string]any{"model": "claude-sonnet-4-20250514"})
 
 stream.Publish("hello")
 stream.Publish(" world")
 ```
 
-The key thing here is `created`. If it is `false`, this session already has an active producer, and you should not start another one.
+`created` is the important bit — if it's `false`, a producer is already running for this session.
 
-Subscribe from any instance:
+Subscribe (from any instance):
 
 ```go
 stream := hub.Get("chat:123")
@@ -110,21 +63,19 @@ if stream == nil {
 	return
 }
 
-// Replays all existing chunks first, then streams new ones live
 chunks, unsubscribe := stream.Subscribe(128)
 defer unsubscribe()
 
 for chunk := range chunks {
-	// write to SSE / WebSocket / HTTP response
+	// replays existing chunks first, then streams live
 	println(chunk)
 }
 ```
 
-Cancel a running stream remotely:
+Cancel:
 
 ```go
-stream := hub.Get("chat:123")
-if stream != nil {
+if stream := hub.Get("chat:123"); stream != nil {
 	stream.Cancel()
 }
 ```
@@ -137,23 +88,19 @@ Creates a `Hub`.
 
 ### `hub.Register(sessionID, cancelRuntime)`
 
-Tries to register a new stream.
-
-- `sessionID` is your business/session identifier
-- `cancelRuntime` is called when a cancel signal is received
-- `created` tells you whether this call actually became the producer
+Tries to claim a session as producer. Returns `(stream, created, err)` — check `created` before writing.
 
 ### `hub.Get(sessionID)`
 
-Returns a proxy for an existing stream. If Redis has no such stream, it returns `nil`.
+Returns a handle for an existing stream, or `nil`.
 
 ### `hub.Active(sessionIDs)`
 
-Checks which session IDs are still active.
+Checks which sessions are still active.
 
 ### `hub.Remove(sessionID)`
 
-Deletes the Redis keys and local state for a stream.
+Deletes Redis keys and local state for a stream.
 
 ### `stream.Publish(chunk)`
 
@@ -161,41 +108,42 @@ Publishes a chunk.
 
 ### `stream.Subscribe(bufExtra)`
 
-Subscribes to the stream. Existing chunks are replayed first, then new chunks are delivered live.
+Subscribes. Replays existing chunks, then delivers new ones live.
 
 ### `stream.SetMetadata(v)` / `stream.Metadata(&target)`
 
-Stores and loads per-stream metadata.
+Stores / loads per-stream JSON metadata.
 
 ### `stream.Cancel()`
 
-Sends a cancel signal via Redis Pub/Sub.
+Sends a cancel signal via Pub/Sub.
 
 ### `stream.Close()`
 
-Marks the stream as done and stops local subscriber loops.
+Marks the stream as done.
 
 ### `stream.Done()`
 
-Reports whether the stream is already done.
+Reports whether the stream has finished.
 
 ## Typical flow
 
-1. Call `Register` when a request comes in
-2. Start the actual background job only when `created == true`
-3. Keep calling `Publish` while the job is running
-4. Let readers consume data through `Get(...).Subscribe(...)` — from any instance
-5. Call `Close` when the job finishes
-6. Call `Cancel` if the user stops the session early
-
-If your service runs on multiple instances, this is much easier to manage than keeping the stream state in process memory.
+1. `Register` when a request comes in
+2. Only start the job if `created == true`
+3. `Publish` chunks as they're generated
+4. Consumers call `Get` + `Subscribe` from any instance
+5. `Close` when done, `Cancel` if the user aborts
 
 ## Notes
 
-- Do not start another producer when `created == false`
+- Don't start a second producer when `created == false`
 - Call `SetMetadata` before `Close`
-- Always call the `unsubscribe` returned by `Subscribe`
-- Stream lifetime and expiry are driven by Redis state
+- Always call `unsubscribe`
+
+## See also
+
+- [vercel/resumable-stream](https://github.com/vercel/resumable-stream) — same idea, TypeScript, tied to the Vercel AI SDK
+- [ai-resumable-stream](https://github.com/zirkelc/ai-resumable-stream) — TypeScript, also Redis-backed
 
 ## License
 
