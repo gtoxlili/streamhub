@@ -66,7 +66,7 @@ if stream == nil {
 	return
 }
 
-chunks, unsubscribe := stream.Subscribe(128)
+chunks, unsubscribe := stream.Subscribe(streamhub.WithBuffer(128))
 defer unsubscribe()
 
 for chunk := range chunks {
@@ -79,7 +79,9 @@ Cancel:
 
 ```go
 if stream := hub.Get("chat:123"); stream != nil {
-	stream.Cancel()
+	// Pass context.Background() for fire-and-forget, or a timeout to wait
+	// for the producer to finish persisting.
+	stream.Cancel(context.Background())
 }
 ```
 
@@ -109,17 +111,20 @@ Deletes Redis keys and local state for a stream.
 
 Publishes a chunk.
 
-### `stream.Subscribe(bufExtra)`
+### `stream.Subscribe(opts...)`
 
-Subscribes. Replays existing chunks, then delivers new ones live.
+Subscribes. Replays existing chunks, then delivers new ones live. Options:
+`WithBuffer(n)` tunes the channel buffer; `WithBatchReplay()` concatenates
+replay into one string instead of sending chunks one-by-one.
 
 ### `stream.SetMetadata(v)` / `stream.Metadata(&target)`
 
 Stores / loads per-stream JSON metadata.
 
-### `stream.Cancel()`
+### `stream.Cancel(ctx)`
 
-Sends a cancel signal via Pub/Sub.
+Sends a cancel signal via Pub/Sub and waits for the producer to finish
+(or `ctx` to expire). Use `context.Background()` for fire-and-forget.
 
 ### `stream.Close()`
 
@@ -142,6 +147,23 @@ Reports whether the stream has finished.
 - Don't start a second producer when `created == false`
 - Call `SetMetadata` before `Close`
 - Always call `unsubscribe`
+- **Ensure `Close` runs on every producer exit path**, including panics.
+  If your producer goroutine panics or its input channel never closes,
+  `Close` never runs, heartbeat keeps refreshing TTL, and the session
+  looks "streaming forever" to every client. The safe pattern:
+  ```go
+  go func() {
+      defer func() {
+          if r := recover(); r != nil { /* log */ }
+          live.Close()
+          cancelRuntime()
+      }()
+      for chunk := range runtime.Chunks {
+          live.Publish(chunk)
+      }
+      live.SetMetadata(usage)
+  }()
+  ```
 
 ## See also
 
