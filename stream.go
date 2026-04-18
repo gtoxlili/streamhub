@@ -53,9 +53,16 @@ func newLiveStream(hub *Hub, sessionID, generation string) *LiveStream {
 // activeTTL is the lease for an active stream.
 const activeTTL = 600 // seconds (10 min)
 
-// Publish appends a chunk to Redis if the generation still matches.
+// publishTimeout bounds a single Publish so a Redis stall can't block the
+// whole producer goroutine indefinitely.
+const publishTimeout = 5 * time.Second
+
+// Publish appends a chunk to Redis if the generation still matches and the
+// stream is still active. Fails silently on stale generation, closed stream,
+// or Redis errors — producers should treat Publish as best-effort.
 func (s *LiveStream) Publish(chunk string) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), publishTimeout)
+	defer cancel()
 	publishScript.Exec(ctx, s.client,
 		[]string{metaKey(s.sessionID), chunksKey(s.sessionID)},
 		[]string{s.generation, chunk, fmt.Sprint(activeTTL)},
@@ -190,8 +197,10 @@ func (s *LiveStream) xreadLoop(ctx context.Context, key, cursor string, ch chan 
 				return
 			}
 			if rueidis.IsRedisNil(err) {
-				// XREAD timed out, so check whether the stream ended.
-				if s.Done() {
+				// XREAD timed out. Check whether the stream ended normally
+				// or the keys are gone (Remove / TTL expiry); otherwise the
+				// loop would spin forever on a vanished stream.
+				if s.Done() || !s.metaExists() {
 					s.drainRemaining(key, cursor, ch)
 					return
 				}
@@ -205,12 +214,39 @@ func (s *LiveStream) xreadLoop(ctx context.Context, key, cursor string, ch chan 
 		for _, rangeEntries := range entries {
 			for _, e := range rangeEntries {
 				if d, ok := e.FieldValues["d"]; ok {
-					ch <- d
+					// Fast path: send without entering the cancel-aware
+					// select when the consumer has space. This keeps the
+					// normal Close path (closeCh fired while processing
+					// a batch) from racing ch<-d against closeCh — Go's
+					// uniform-random select would otherwise drop most of
+					// the in-flight batch even when the consumer is fine.
+					select {
+					case ch <- d:
+					default:
+						select {
+						case ch <- d:
+						case <-ctx.Done():
+							s.drainRemaining(key, cursor, ch)
+							return
+						case <-s.closeCh:
+							s.drainRemaining(key, cursor, ch)
+							return
+						}
+					}
 				}
 				cursor = e.ID
 			}
 		}
 	}
+}
+
+// metaExists reports whether the meta key is still present. Used to detect
+// a stream that was Removed or expired while a subscriber was connected.
+func (s *LiveStream) metaExists() bool {
+	n, err := s.client.Do(context.Background(),
+		s.client.B().Exists().Key(metaKey(s.sessionID)).Build(),
+	).AsInt64()
+	return err == nil && n > 0
 }
 
 // drainRemaining flushes chunks after cursor before closing ch.
@@ -233,24 +269,20 @@ func (s *LiveStream) drainRemaining(key, cursor string, ch chan string) {
 }
 
 // SetMetadata stores stream metadata as JSON.
-// It only writes when the current generation still owns the stream.
+// It only writes when the current generation still owns the stream. The
+// ownership check and the write are atomic, so a late writer from a stale
+// generation can't overwrite a new owner's metadata.
 func (s *LiveStream) SetMetadata(v any) {
 	if s.generation == "" {
-		return
-	}
-	ctx := context.Background()
-	mk := metaKey(s.sessionID)
-	// Do not let an old generation overwrite metadata.
-	gen, _ := s.client.Do(ctx, s.client.B().Hget().Key(mk).Field("gen").Build()).ToString()
-	if gen != s.generation {
 		return
 	}
 	b, err := json.Marshal(v)
 	if err != nil {
 		return
 	}
-	s.client.Do(ctx,
-		s.client.B().Hset().Key(mk).FieldValue().FieldValue("metadata", string(b)).Build(),
+	setMetadataScript.Exec(context.Background(), s.client,
+		[]string{metaKey(s.sessionID)},
+		[]string{s.generation, string(b)},
 	)
 }
 
@@ -269,28 +301,25 @@ func (s *LiveStream) Metadata(target any) bool {
 // If this generation is stale, Close only shuts down local state.
 func (s *LiveStream) Close() {
 	s.closeOnce.Do(func() {
-		ctx := context.Background()
-		mk := metaKey(s.sessionID)
-		ck := chunksKey(s.sessionID)
-
-		// Only the current owner can close the Redis-side stream.
-		if s.generation != "" {
-			gen, _ := s.client.Do(ctx,
-				s.client.B().Hget().Key(mk).Field("gen").Build(),
-			).ToString()
-			if gen != s.generation {
-				// A stale producer should only stop its own local work.
-				close(s.closeCh)
-				return
-			}
+		// Subscriber-only stream (from hub.Get) has no generation to
+		// fence with — stop local work but never touch shared state.
+		if s.generation == "" {
+			close(s.closeCh)
+			return
 		}
 
-		// Mark the stream as done.
-		s.client.Do(ctx, s.client.B().Hset().Key(mk).
-			FieldValue().FieldValue("status", "done").Build())
-		// Keep keys briefly so remote readers can observe the done state.
-		s.client.Do(ctx, s.client.B().Expire().Key(mk).Seconds(int64(keyTTL.Seconds())).Build())
-		s.client.Do(ctx, s.client.B().Expire().Key(ck).Seconds(int64(keyTTL.Seconds())).Build())
+		// Atomically verify ownership, mark done, and trim TTL. A stale
+		// producer whose lease expired during Close could otherwise
+		// clobber the new owner's status/TTL in the gap between the
+		// old code's separate HGET and HSET calls.
+		result, _ := closeScript.Exec(context.Background(), s.client,
+			[]string{metaKey(s.sessionID), chunksKey(s.sessionID)},
+			[]string{s.generation, fmt.Sprint(int64(keyTTL.Seconds()))},
+		).AsInt64()
+		if result == 0 {
+			close(s.closeCh)
+			return
+		}
 
 		// Stop local readers first, then close closeCh as a fallback.
 		s.mu.Lock()
